@@ -30,6 +30,7 @@
     "rate-limits",
     "priority",
     "idempotency",
+    "idempotency-keys",
     "batch-tasks",
     "cel-expressions",
     "---Durable Execution---",

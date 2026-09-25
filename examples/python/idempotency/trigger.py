@@ -29,3 +29,7 @@ async def main() -> None:
 
     assert res_1 == res_2
     assert ref_1.workflow_run_id == run_id_2
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

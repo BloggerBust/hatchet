@@ -1,0 +1,228 @@
+---
+title: "Idempotency keys for background jobs"
+---
+
+import { snippets } from "@/lib/generated/snippets";
+import { Snippet } from "@/components/code";
+import { Callout, Tabs } from "@/components/nextra-compat";
+import UniversalTabs from "@/components/UniversalTabs";
+
+In July, Alexander set out to find [the first idempotency key](https://hatchet.run/blog/first-idempotency-key) despite playful protest from his dog Ringo. Today I am going to explore how we can make background jobs safe to run more than once. To satisfy my own curiosity, I am also going to investigate how the term entered the software industry in the first place.
+
+## What's in a name?
+
+> That which we call a rose<br />
+> By any other name would smell as sweet;
+
+As it turns out, the name idempotent was not chosen arbitrarily. The word is formed from two Latin roots: _idem_, meaning "the same", and _potentem_, meaning "having power". Taken literally, the word suggests "the same power", and in the software industry we use it to mean something that, when applied again, has the same effect. But who coined this term and why?
+
+## A labor of love
+
+[Benjamin Peirce](https://en.wikipedia.org/wiki/Benjamin_Peirce), a mathematician and professor at Harvard University, authored _Linear Associative Algebra_, which was published in 1870 and contained the passage:
+
+> When an expression raised to the square or any higher power vanishes, it may be called nilpotent; but when, raised to a square or higher power, it gives itself as the result, it may be called idempotent.
+
+In 1867 Peirce was appointed the Superintendent of the US Coast Survey, where Julius Erasmus Hilgard was in charge of the Survey's Washington office. That same year, Peirce began presenting his algebra research to the National Academy of Sciences. Peirce was one of the National Academy's original charter members, and his name appears on the 1863 incorporation act signed by Abraham Lincoln. His research collection eventually became the memoir _Linear Associative Algebra_, which the Academy intended to publish as part of its _Memoirs_.
+
+According to historian [Ivor Grattan-Guinness](https://en.wikipedia.org/wiki/Ivor_Grattan-Guinness), the National Academy of Sciences could not afford conventional publication at the time. Rather than wait for the National Academy to raise the publication money, Hilgard proposed producing copies using the lithographic method. A woman associated with the US Coast Survey copied Peirce's manuscript in lithographic ink. Despite not understanding the mathematics, she was able to accurately transcribe Peirce's handwriting. Hilgard described the effort as largely a "labor of love," with people connected to the Coast Survey Office working during otherwise unoccupied hours or in their own leisure time.
+
+## From algebra to distributed systems
+
+Something important happened in our more recent history when software stopped being a single program you run on one machine. The Internet research community was busy designing the system of name servers and resolvers documented in [RFC-883](https://www.rfc-editor.org/info/rfc883/). A name server requires transaction-oriented communication, and they debated choosing between TCP and UDP protocols. They wanted to avoid TCP's substantial overhead despite its reliability guarantees, but UDP had its own problems; in particular, UDP packets may be lost or duplicated, or may arrive out of order. They needed a way to deal with UDP's reliability shortfall. This was a problem that idempotency was well suited for. The concept was already established in mathematics and theoretical computer science and, for a function, can be denoted as:
+
+```
+f(f(x)) = f(x)
+```
+
+By the early 1980s, distributed-systems researchers were using the word in a directly practical sense: an operation that can be repeated after a lost or duplicated message without producing an additional effect. In January 1981, David Cheriton described a [distributed I/O system](https://www.cs.ubc.ca/sites/default/files/tr/1981/TR-81-01.pdf) built on an object-based protocol that is "connectionless because it consists of idempotent operations", noting that a server may receive duplicate messages "which are handled by the idempotency of the protocol". By 1985, the term had clearly moved into Internet protocol engineering. [RFC-955, _Towards a Transport Service for Transaction Processing Applications_](https://www.rfc-editor.org/info/rfc955/#section-3) notes:
+
+> Note that name server requests have a special property, idempotency; as a result, lost, duplicated, or reordered queries do not prevent the name-server system from working.
+
+A particularly important milestone came soon after, when Sun's NFS specification, RFC-1094, was published in 1989, documenting that one of NFS's basic recovery strategies was to make operations as _idempotent as possible_, specifically so they could be repeated after failures.
+
+## En route to better abstraction
+
+The dot-com era was already well underway when RFC-2068, the first HTTP/1.1 specification, was published in January 1997, having an entire [section titled _Idempotent Methods_](https://www.rfc-editor.org/info/rfc2068/#section-9.1). Every web developer, including yours truly, had to learn why `PUT` is expected to be idempotent, but `POST` need not be. As more businesses and services rushed their operations online, scalability posed some of the toughest challenges to overcome in the era. To operate at scale, it became common practice to enqueue slow or bursty work, moving it outside of the service request path where it can be run asynchronously. However, another problem remained: how can we deduplicate requested work when separate requests represent the same logical operation?
+
+## One identity for one operation
+
+> No entity without identity.<br />
+> — W. V. Quine, _Speaking of Objects_
+
+Quine argued that if a theory describes the existence of an object, no matter how abstract, there must be a criterion for distinguishing when two apparent instances are the same and when they are different. An idempotency key captures that criterion for logical operations. It is a stable name, chosen once and reused whenever the operation is attempted. While an idempotency key provides the criterion for deduplication, it is not self-fulfilling. Some mechanism must make use of that identity to determine if work should be admitted. In Hatchet, when a task declares an [idempotency key](/v1/idempotency), deduplication happens at the point where a trigger becomes a run. The engine tries to claim the idempotency key of the triggered work, but if the key is already claimed, the run is rejected. However, if something unexpected happens, we may not be able to tell whether an operation completed. In that case, should we retry the operation and risk repeating its effects, or stop and risk losing the work?
+
+## Multiple attempts may be needed
+
+> Two kisses indeed, not just one did she need<br />
+> — Orin Cochrane, _Blue Frog_
+
+In software, as in poetry, sometimes once simply isn't enough. At least, we cannot rely on it being enough. Consider the most basic background job there is: sending a welcome email. The expected workflow is simple: a user signs up, the request handler enqueues the job to send the welcome email to the new user, and a worker eventually picks up the job and calls the email provider. After that, the worker acknowledges the job as complete. But what happens if the worker loses its network connection after the provider has accepted the email, but before the job is acknowledged as complete? The queue will not consider the job successfully handled and will eventually make it available for another attempt.
+
+In fact, at-least-once task execution is one of Hatchet's [core reliability guarantees](/v1/architecture-and-guarantees#at-least-once-task-execution). Hatchet will not silently drop a task and will retry failed tasks according to the configured [retry policy](/v1/retry-policies). Repeated execution is an expected tradeoff when a system retries work whose completion is uncertain. This raises the question: how can we ensure subsequent executions do not cause cumulative effects?
+
+## Idempotency for local effects
+
+> What's done cannot be undone.<br />
+> — William Shakespeare, _Macbeth_
+
+Unlike murder, mistakes can often be corrected. However, even in software, correcting mistakes comes at a cost. It is better to avoid them in the first place. Consider the most basic user credit account schema:
+
+```sql
+CREATE TABLE processed_job (
+    idempotency_key text PRIMARY KEY
+);
+
+CREATE TABLE account_credit (
+    user_id text NOT NULL,
+    amount integer NOT NULL
+);
+```
+
+Now let's consider a contrived but simple-to-reason-about scenario. Suppose you are generous and would like to grant all user accounts some credit just for signing up. Cleverly, you check to see if the signup-credit operation has already been processed before granting the credit. After a short barrage of clicks and clacks from your mechanical keyboard, you sit back and admire the simplicity and elegance of your creation:
+
+<UniversalTabs items={["Python", "Typescript", "Go"]}>
+  <Tabs.Tab>
+    <Snippet src={snippets.python.idempotency_keys.naive.check_then_insert} />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet
+      src={snippets.typescript.idempotency_keys.naive.check_then_insert}
+    />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet src={snippets.go.idempotency_keys.naive.check_then_insert} />
+  </Tabs.Tab>
+</UniversalTabs>
+
+Your generosity will be appreciated by all, and it won't break the bank. Right? You spin up a single worker and run some tests. Sure enough, it correctly rejects adding signup credit to accounts that have already received it. You are happy with the results, so you release it into production and make a proud announcement on LinkedIn. The next morning over a cup of coffee you review your daily analytics and are thrilled to see a massive spike in user signups. Pleased, you check your revenue forecast and immediately start choking on your coffee. Significantly more credit had been granted than should have been.
+
+The implementation's logic is not wrong when executed sequentially. However, when two workers run the code concurrently, they can both check the idempotency table before either records the operation as processed. The race condition exists because checking whether the operation has already been processed, granting the credit, and inserting its completion record are independent statements.
+
+While there are ways to solve race conditions in application code, a simple and efficient solution is to stop asking the application to make the decision. Instead, let Postgres use the unique constraint to check and claim the operation in a single statement:
+
+<UniversalTabs items={["Python", "Typescript", "Go"]}>
+  <Tabs.Tab>
+    <Snippet src={snippets.python.idempotency_keys.claim.atomic_claim} />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet src={snippets.typescript.idempotency_keys.claim.atomic_claim} />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet src={snippets.go.idempotency_keys.claim.atomic_claim} />
+  </Tabs.Tab>
+</UniversalTabs>
+
+When two or more claim requests for the same key run concurrently, Postgres resolves the contention using the table's unique constraint. If the first transaction commits, the second encounters the existing key, and the `ON CONFLICT DO NOTHING` clause ensures nothing is inserted. On the other hand, if the first rolls back, the second will attempt to insert the key instead. The claim request returns true when the insert succeeds and false when an existing key invokes the `DO NOTHING` clause.
+
+Enlightened with new knowledge of Postgres clauses, you hammer on your keyboard some more, this time making the claim request and crediting the account all within the same database transaction, so that if the transaction rolls back, neither change is committed:
+
+<UniversalTabs items={["Python", "Typescript", "Go"]}>
+  <Tabs.Tab>
+    <Snippet src={snippets.python.idempotency_keys.local_effect.local_effect} />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet
+      src={snippets.typescript.idempotency_keys.local_effect.local_effect}
+    />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet src={snippets.go.idempotency_keys.local_effect.local_effect} />
+  </Tabs.Tab>
+</UniversalTabs>
+
+This time you test the behavior more thoroughly, explicitly setting up concurrent requests and forcing contention, and to your delight, only one signup credit is applied per account. In fact, this pattern guarantees that the signup credit can be committed at most once for a given idempotency key. But what happens if the effect is outside of our control?
+
+## The uncertainty of external effects
+
+> Suppose the last messenger in P gets lost.<br />
+> — Jim Gray, [_Notes on Data Base Operating Systems_](https://jimgray.azurewebsites.net/papers/dbos.pdf)
+
+As you read those words on the side of your coffee mug, your mind takes you back to your life on campus and your study of distributed systems. You loved solving puzzles and thinking through thought experiments. In this one, Gray was describing two generals trying to coordinate the capture of a hill. Their only means to communicate is by sending runners between their camps to deliver their messages. A returning runner may acknowledge that a message has been received. Sometimes runners get lost, never completing the delivery. Even if a message is received, an acknowledgement may not be. No matter how many runners they send, the uncertainty over whether the last message arrived remains.
+
+Distributed systems can have similar communication and coordination uncertainties. Imagine you want to send new users a welcome email. This is simpler than the Two Generals problem, but let's imagine that our email-dispatch worker sends a request to the email provider, which in turn sends the email. The provider returns a successful response; however, it never reaches the worker due to an unexpected network interruption. Even though the provider sent the email, the worker has no way to know that. That is our lost runner. Herein lies the dilemma. Choose to retry, and the user may get a second welcome email, which is mildly embarrassing. Or choose not to retry, hoping that the email made it through, but if it did not, the user may never complete onboarding.
+
+Consider the signup-credit operation we discussed previously. Postgres could atomically claim the operation and apply the credit because it controlled both changes. However, it cannot roll back an email sent by another system. Our database does not control the effect of this operation; the provider does. But some APIs give us another option: they support idempotency keys. If we send the same logical identity with every attempt, the provider can recognize that it has already handled the operation and avoid applying the effect again.
+
+Inspired by Gray's analogy, you set off to build your customers a proper onboarding experience, starting with the welcome email. Before choosing a suitable email provider, you decide to mock one up yourself so that you can get something working quickly. With your fingers ablaze you implement a simple provider that accepts an idempotency key. Your implementation caches the result under that key and returns it for subsequent requests with the same key. A request without a key always sends.
+
+<UniversalTabs items={["Python", "Typescript", "Go"]}>
+  <Tabs.Tab>
+    <Snippet
+      src={snippets.python.idempotency_keys.external_effect.stub_provider}
+    />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet
+      src={snippets.typescript.idempotency_keys.external_effect.stub_provider}
+    />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet src={snippets.go.idempotency_keys.external_effect.stub_provider} />
+  </Tabs.Tab>
+</UniversalTabs>
+
+You proceed to implement the job of sending the email. Thinking more about Gray's analogy, you realize that you cannot eliminate the uncertainty caused by a lost runner. But the Internet research community had already shown you a practical way forward: when repetition cannot be avoided, make it safe. You ensure that the job receives a stable identity for the welcome-email operation and forwards it to the provider. Now every attempt sends the same logical identity.
+
+To address the lost-runner dilemma, you make the pragmatic decision that an occasional redundant provider call is a small price to pay for avoiding silently lost onboarding emails. Because the provider is called first, any error raised prevents execution from reaching the claim that marks the operation as processed, including timeout errors that may represent a lost runner. You still do not know whether the provider performed the effect, but a retry can safely send the same logical identity again because your mock provider honors the idempotency key and recognizes the repeated operation instead of sending another email.
+
+<UniversalTabs items={["Python", "Typescript", "Go"]}>
+  <Tabs.Tab>
+    <Snippet
+      src={snippets.python.idempotency_keys.external_effect.external_effect}
+    />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet
+      src={snippets.typescript.idempotency_keys.external_effect.external_effect}
+    />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet
+      src={snippets.go.idempotency_keys.external_effect.external_effect}
+    />
+  </Tabs.Tab>
+</UniversalTabs>
+
+## Where Hatchet fits
+
+At this point, you have made the task of sending a welcome email safe to run more than once. You may have noticed that there is a race condition. If the same operation is triggered twice before either run reaches `claim` to record the operation as processed, both runs can call the provider. The provider-side idempotency key keeps those calls from becoming duplicate emails, but it would be better if the second run never existed in the first place.
+
+This is where Hatchet's own idempotency fits into the picture. A task can declare an idempotency key expression that Hatchet evaluates when the task is triggered, before a run is created. If another trigger produces the same key while that key is still active, Hatchet refuses to create another run:
+
+<UniversalTabs items={["Python", "Typescript", "Go"]}>
+  <Tabs.Tab>
+    <Snippet src={snippets.python.idempotency.worker.idempotency} />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet src={snippets.typescript.idempotency.workflow.idempotency} />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet src={snippets.go.idempotency.worker.idempotency} />
+  </Tabs.Tab>
+</UniversalTabs>
+
+If a task is triggered multiple times with the same `id` while the key is active, only the first trigger will create a run. Subsequent attempts from the SDK receive an idempotency collision containing the id of the run that claimed the key. The caller can use that id to wait for the run to complete and retrieve the result:
+
+<UniversalTabs items={["Python", "Typescript", "Go"]}>
+  <Tabs.Tab>
+    <Snippet src={snippets.python.idempotency.trigger.trigger} />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet src={snippets.typescript.idempotency.run.trigger} />
+  </Tabs.Tab>
+  <Tabs.Tab>
+    <Snippet src={snippets.go.idempotency.trigger.trigger} />
+  </Tabs.Tab>
+</UniversalTabs>
+
+<Callout type="info">
+  Note: This example keeps the key active for a fixed TTL. Hatchet also supports
+  status-based idempotency, where the key remains active until the run reaches a
+  terminal status, with a fallback TTL as a safety net.
+</Callout>
+
+Hatchet's at-least-once task execution guarantee should now make sense. A failed or [reassigned](/v1/faq#why-am-i-seeing-missed-heartbeats-and-task-reassignments) task may execute again, so it is your application's responsibility to make the effects inside that task safe to repeat. For local effects, that may mean coordinating the idempotency claim and the effect in the same transaction. When an external provider supports idempotency keys, the same stable identity should be forwarded on every attempt.
+
+Hatchet's responsibility is different. It provides durable orchestration around those effects by persisting runs, managing retries and reassignment, and keeping run status and output available. With idempotency configured, Hatchet can prevent duplicate triggers from becoming duplicate runs, but the task still decides what happens when its body executes again.
+
+To simulate Gray's lost runner and run the examples and their tests yourself, follow the [instructions in the Hatchet repository](https://github.com/hatchet-dev/hatchet/blob/main/sdks/python/examples/idempotency_keys/README.md).
