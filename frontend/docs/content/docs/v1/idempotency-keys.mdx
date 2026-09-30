@@ -9,6 +9,10 @@ import UniversalTabs from "@/components/UniversalTabs";
 
 In July, Alexander set out to find [the first idempotency key](https://hatchet.run/blog/first-idempotency-key) despite playful protest from his dog Ringo. Today I am going to explore how we can make background jobs safe to run more than once. To satisfy my own curiosity, I am also going to investigate how the term entered the software industry in the first place.
 
+<Callout type="tip">
+  Want to jump straight to the implementation? Skip ahead to [Idempotency for local effects](#idempotency-for-local-effects).
+</Callout>
+
 ## What's in a name?
 
 > That which we call a rose<br />
