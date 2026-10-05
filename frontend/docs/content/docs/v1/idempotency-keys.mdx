@@ -1,5 +1,6 @@
 ---
 title: "Idempotency keys for background jobs"
+description: "How to make background jobs safe to run more than once, how idempotency keys make retries safe, and where Postgres, external APIs, and Hatchet fit."
 ---
 
 import { snippets } from "@/lib/generated/snippets";
@@ -10,8 +11,11 @@ import UniversalTabs from "@/components/UniversalTabs";
 In July, Alexander set out to find [the first idempotency key](https://hatchet.run/blog/first-idempotency-key) despite playful protest from his dog Ringo. Today I am going to explore how we can make background jobs safe to run more than once. To satisfy my own curiosity, I am also going to investigate how the term entered the software industry in the first place.
 
 <Callout type="tip">
-  Want to jump straight to the implementation? Skip ahead to [Idempotency for local effects](#idempotency-for-local-effects).
+  Want to jump straight to the implementation? Skip ahead to{" "}
+  <a href="#idempotency-for-local-effects">Idempotency for local effects</a>.
 </Callout>
+
+We begin with the meaning and history of idempotent, including what may be the earliest published use of the word in Benjamin Peirce's _Linear Associative Algebra_ in 1870. From there, we trace the idea into distributed systems, where unreliable communication made repeated operations a practical problem. This led to the need for a stable identity for one logical operation across multiple attempts, which we now refer to as an idempotency key. Repeated execution is sometimes unavoidable. When the effect lives in your own database, Postgres can make it safe by claiming the operation and applying the effect in one transaction. When the effect lives somewhere else, making a repeat safe requires the cooperation of the external system that owns it. Hatchet's own idempotency can prevent a duplicate trigger from turning into a duplicate run, while the application remains responsible for making the effects inside a task safe to repeat.
 
 ## What's in a name?
 
