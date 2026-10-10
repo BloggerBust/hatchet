@@ -30,6 +30,7 @@
     "rate-limits",
     "priority",
     "idempotency",
+    "fastapi-background-tasks",
     "batch-tasks",
     "cel-expressions",
     "---Durable Execution---",

@@ -1,0 +1,201 @@
+---
+title: "FastAPI: When Work Must Survive"
+description: "How FastAPI background tasks behave after the response, what happens during graceful shutdown and process failure, and when you need durable execution, retries, or a task queue."
+---
+
+import { snippets } from "@/lib/generated/snippets";
+import { Snippet } from "@/components/code";
+
+For dinner, my wife and I were making chicken pesto pasta with pine nuts and sun-dried tomatoes. My absolute favorite. We were at our local Italian Centre and I just pulled our ticket from the ticketing dispenser at the deli to ensure our place in the growing queue. We continued to browse the produce in search of garlic-stuffed olives and Camembert cheese, when I started thinking how nice it was that we did not need to wait in a line. Instead, we could move around freely while planning our evening and gathering items from our shopping list. When our ticket number was called, we let the clerk know how much pasta dough and shaved chicken we wanted, then we continued to browse the produce and chat about the happenings of the past week. We did not wait in a line-up when we arrived with intent to place an order, nor did we wait in a line-up while our order was being processed. Instead, we planned our evening, continued shopping and enjoyed a nice conversation while the deli clerk worked in the background. A short while later, the clerk got our attention. They were all out of chicken, so we changed our order to prosciutto, which seemed to please the clerk very much.
+
+What I just described is one solution to a recurring architectural problem. The requester does not always need to remain blocked while work happens somewhere else. But there are two importantly different versions of that idea. Sometimes the requester merely stops waiting. Other times, somebody else takes responsibility for remembering the work and seeing it through. In either case, a request may be accepted, but never fulfilled.
+
+We begin by looking at what _background_ has meant in computing, from durable IBM batch jobs to the UNIX shell and HTTP `202 Accepted`. From there, we look at what FastAPI's `BackgroundTasks` actually does; Starlette sends the response first and then awaits the work in the same web application process. Not every background task needs durability. We test what happens to in-flight `BackgroundTasks` during Uvicorn graceful shutdown and abrupt process termination, then establish the criteria for deciding when disposable post-response work belongs in `BackgroundTasks`. When the obligation to complete the work must survive the web process, or the work needs retries, scheduling, concurrency control, or independent scaling, durable orchestration becomes the better fit. Finally, we make the comparison concrete by implementing welcome-email delivery with FastAPI's `BackgroundTasks`. Then we migrate the work to Hatchet, which durably records the work and assumes responsibility for coordinating attempts to complete it.
+
+## Accepted is not done
+
+Computer background jobs were in use before the World Wide Web. By the 1970s IBM batch systems, such as JES (Job Entry Subsystem), had most of the machinery a modern programmer would recognize in a durable job architecture. The system could accept jobs from a wide variety of input sources, including a human at a remote terminal, punch card readers, other programs, other nodes and much more. Each job would be assigned an identity, then persisted to disk as part of a spooled dataset and enqueued for execution. The output of successfully completed jobs was retained and some interrupted work could be resumed rather than starting over. The system would take custody of the work and was responsible for it, having the ability to schedule the work independently of the originating request.
+
+Ritchie and Thompson describe another meaning of the term _background_ in their 1974 paper [the UNIX Time Sharing System](https://www.cs.cmu.edu/~15712/papers/ritchie74.pdf):
+
+> If a command is followed by "&", the Shell will not wait for the command to finish before prompting again; instead, it is ready immediately to accept a new command.
+
+In a UNIX-like environment, background execution begins immediately. The job is not inherently persisted to a spool or enqueued to run at some future time. By running the command in the background, the human is free to go on to other things, but responsibility for the work has not been handed to a durable system.
+
+Roughly two decades later, HTTP inventor Tim Berners-Lee would face the same reoccurring architectural problem. Berners-Lee needed to formalize how to handle a request whose exchange could end before the work it initiated is completed, or perhaps even started. In a November 05, 1993 internet draft of the [Hypertext Transfer Protocol (HTTP)](https://www.w3.org/History/1992/http-spec.txt), Berners-Lee included the status `Accepted 202`:
+
+> The request has been accepted for processing, but the processing<br />
+> has not been completed. The request may or may not eventually be<br />
+> acted upon, as it may be disallowed when processing actually takes<br />
+> place. there is no facility for status returns from asynchronous<br />
+> operations such as this.
+
+That last sentence means whatever asynchronous work follows has a lifetime of its own. Once the response is gone, HTTP does not come back later and replace it with _actually, that failed_. If the eventual outcome matters, the application needs to implement its own mechanism the client can query.
+
+Then, in [RFC-1945: Hypertext Transfer Protocol -- HTTP/1.0](https://www.rfc-editor.org/info/rfc1945/#section-9.2) the description for the status code `202 Accepted` was expanded:
+
+> The 202 response is intentionally non-committal. Its purpose is to<br />
+> allow a server to accept a request for some other process (perhaps<br />
+> a batch-oriented process that is only run once per day) without<br />
+> requiring that the user agent's connection to the server persist<br />
+> until the process is completed.
+
+An HTTP status `202` tells a client that the exchange has completed, but not that the work will be durably handled. This brings us to FastAPI, which in its [Background Tasks tutorial](https://fastapi.tiangolo.com/tutorial/background-tasks/) uses `202` in exactly this context:
+
+> For example, let's say you receive a file that must go through a slow process, you can return a response of "Accepted" (HTTP 202) and process the file in the background.
+
+That leaves me wondering, does FastAPI provide durability for background tasks, or is this merely about allowing me to get on with other things?
+
+## What `BackgroundTasks` actually does
+
+Let's take a look at how FastAPI's [`BackgroundTasks`](https://github.com/fastapi/fastapi/blob/master/fastapi/background.py) class is actually implemented.
+
+```python
+...
+from starlette.background import BackgroundTasks as StarletteBackgroundTasks
+...
+class BackgroundTasks(StarletteBackgroundTasks):
+    def add_task(
+        self,
+        func: Annotated[
+            Callable[P, Any],
+            Doc(
+                """
+                The function to call after the response is sent.
+
+                It can be a regular `def` function or an `async def` function.
+                """
+            ),
+        ],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> None:
+        return super().add_task(func, *args, **kwargs)
+
+    async def __call__(self) -> None:
+        for task in self.tasks:
+            with _operation(name="background_task", function=task.func):
+                await task()
+```
+
+It is a thin subclass of Starlette's own [`BackgroundTasks`](https://starlette.dev/background/) class that FastAPI integrates with its [dependency injection system](https://fastapi.tiangolo.com/tutorial/dependencies/). Starlette provides the actual `BackgroundTasks` container, and as you can see in [`Response.__call__`](https://github.com/Kludex/starlette/blob/1.7.0/starlette/responses.py#L165-L172) (Starlette 1.7.0) below, it executes it only after sending the response:
+
+```python
+async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+    if scope["type"] == "websocket":
+        send = self._wrap_websocket_denial_send(send)
+    await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+    await send({"type": "http.response.body", "body": self.body})
+
+    if self.background is not None:
+        await self.background()
+```
+
+Nothing about `BackgroundTasks` makes a response `202 Accepted`; the application chooses the status code separately. Starlette simply sends that response first, then awaits the attached background work. That execution model fits `202 Accepted` semantics nicely because the response can finish before the work does. The client stops waiting while the background work labours on. Of course, the same application process is still responsible for the work and nothing in this path persists or enqueues the work. There is no durable hand-off.
+
+## When `BackgroundTasks` is the right tool
+
+You might be wondering if my last point was meant to imply that `BackgroundTasks` is a bad abstraction. It is not. But the criteria under which it provides a material advantage over simply starting an asynchronous task deserve some consideration.
+
+Let's begin by listing some benefits of using FastAPI `BackgroundTasks`:
+
+- moves work out of the response's critical path
+- participates in graceful shutdown
+- runs the task after the response has been sent
+- integrates with FastAPI's multi-level dependency injection system
+
+Imagine we have some non-critical metadata to update independent of the response. We can easily satisfy the first benefit with Python's built-in `asyncio`:
+
+```python
+asyncio.create_task(update_noncritical_metadata())
+```
+
+`asyncio.create_task()` schedules another task to run concurrently. The task may begin before the HTTP response has been sent. Python also leaves management of detached tasks to the application; its documentation recommends retaining references to them and deciding how their exceptions should be handled. A bare `create_task()` may move the work out of the response's critical path, but it does not by itself participate in graceful shutdown or postpone work until after the response has been sent as does `BackgroundTasks`.
+
+A Starlette background task makes different guarantees: as we saw earlier, Starlette first sends the response and then awaits the attached background work before the ASGI request task finishes. That distinction also matters during a graceful shutdown. Uvicorn tracks each ASGI request as one of its running tasks. During graceful shutdown Uvicorn explicitly waits for those running tasks to complete, subject to its configured shutdown deadline.
+
+So `BackgroundTasks` occupies an interesting middle ground. The client does not wait for the work, but the server has not completely detached it either. Under normal operation it runs after the response. During a graceful shutdown it is given an opportunity to finish. If the process is killed outright, however, nothing records the missing work and nothing retries it.
+
+FastAPI `BackgroundTasks` are fully compatible with its dependency injection system. A dependency of a request can accept the `BackgroundTasks` object and add work to it. FastAPI will run that work after the response without requiring the path operation using that dependency to know about it. That can improve separation of concerns, but it is mostly a convenience rather than the architectural reason to choose `BackgroundTasks`.
+
+So what is the ideal use case for FastAPI `BackgroundTasks`? The deciding factor should be whether the post-response lifecycle itself buys us anything. BentoML, an open-source model-serving framework, provides us with a concrete production example in its reverse proxy. In BentoML v1.4.39, [the proxy streams the body of an upstream response](https://github.com/bentoml/BentoML/blob/v1.4.39/src/_bentoml_impl/server/proxy.py#L157-L161) back to the caller. Starlette's `BackgroundTask` closes the resources associated with that upstream request:
+
+```python
+return StreamingResponse(
+    resp.content.iter_any(),
+    status_code=resp.status,
+    headers=resp.headers,
+    background=BackgroundTask(stack.aclose),
+)
+```
+
+The upstream response must remain open while `StreamingResponse` is consuming `resp.content`. Starlette streams the upstream body to the client first, then runs `stack.aclose` after the response has been sent. Starting the cleanup with `asyncio.create_task()` would introduce a race condition. The cleanup could close the upstream resources before `StreamingResponse` finished with them. If the process unexpectedly terminates before the cleanup runs, there is no durable obligation to recover because the process and the network resources it owned disappear together.
+
+We now have the criteria for deciding when `BackgroundTasks` provides a material benefit and is the right tool:
+
+- the result of the work is not required to produce the response
+- losing the work in an unexpected process failure does not leave an obligation that must eventually be fulfilled
+- there is material value in requiring the work to run only after the response has been sent or giving it an opportunity to finish during graceful shutdown
+- the work does not require scaling, scheduling or durable recovery
+
+If all we need is concurrency, `asyncio.create_task()` may be enough. If the obligation to complete the work must survive an unexpected process termination, `BackgroundTasks` is not enough. Its useful territory lies between those two cases.
+
+## For as long as the process shall live
+
+[From FastAPI Background Tasks to Hatchet](https://hatchet.run/blog/fastapi-background-jobs-to-hatchet#getting-to-production) says that tasks not finished "before the application is terminated" are dropped. I was curious under what conditions tasks are dropped in practice. I devised a deliberately simple experiment that uses a three-second background task that writes one marker file when it starts and another when it finishes. I then ran it under three conditions: a normal `SIGTERM`, a `SIGTERM` with a one-second graceful shutdown deadline, and an immediate `SIGKILL`.
+
+<Snippet
+  src={snippets.python.fastapi_blog.shutdown_experiment.shutdown_experiment}
+/>
+
+I ran the experiment with FastAPI 0.143.0, Starlette 1.7.0, and uvicorn 0.54.0. Here are the results:
+
+| Shutdown condition                             | What happens                                    | Outcome                                  |
+| ---------------------------------------------- | ----------------------------------------------- | ---------------------------------------- |
+| `SIGTERM` with default settings                | uvicorn waits for the background task           | Both markers appear; the task finishes   |
+| `SIGTERM` with `--timeout-graceful-shutdown 1` | uvicorn waits one second, then cancels the task | Only `started` appears; the work is lost |
+| `SIGKILL`                                      | The process stops immediately                   | Only `started` appears; the work is lost |
+
+The article was right: tasks that do not finish before the application is terminated are dropped, but that was a simplification of the truth. By default `--timeout-graceful-shutdown` is `None`, which allows in-flight tasks whatever time they need to complete successfully. When set to a positive number, uvicorn will enforce the deadline, but given a long enough deadline, the task will still complete successfully. If the uvicorn process is shut down abruptly, perhaps due to OOM or some other catastrophic failure as simulated by the `SIGKILL`, there is no hope at all for an in-flight task to complete in time, because no process exists to keep it alive.
+
+## The response succeeded. The work did not.
+
+Remember when I ordered shaved chicken from the Italian Centre deli? The deli clerk accepted my order and went off to work on it only to return a short while later with some disappointing news. Although they accepted my order, it could not be fulfilled. We saw that accepted-but-not-completed pattern in `BackgroundTasks`. Starlette sends the response, and after that it awaits the background task. But there is an important consequence that might not be immediately clear. To help clarify, Starlette's own [`BackgroundTasks`](https://starlette.dev/background/#backgroundtasks) documentation has an important callout at the bottom of the page:
+
+> The tasks are executed in order. In case one of the tasks raises an exception, the following tasks will not get the opportunity to be executed.
+
+That raises another important design consideration when planning your workloads. Assuming you have already concluded that the work is disposable by our previously established standards for non-durable workloads, ask one more question: Is it acceptable that if one of these tasks raises, all of the tasks that follow it in the same collection won't run? If the answer is yes, then putting them in the same `BackgroundTasks` collection is fine. Be explicit in your design choices and you won't be surprised when something goes awry.
+
+## The web server pays the toll
+
+Starlette `BackgroundTasks` run in the web application process. The fact that they are removed from the response's critical path and do not hold up the requester can make them feel cheap to run. But there is still a cost to be paid in memory and CPU, and the server must pay that toll. Keep this in mind when planning your workloads. Sometimes the cost becomes too much for the server to bear. Or perhaps the work needs to be scheduled, rate-limited, concurrency-controlled, or scaled independently. In any of these cases, it is time to consider other options. In fact, [FastAPI's Background Tasks caveat](https://fastapi.tiangolo.com/tutorial/background-tasks/#caveat) recommends looking elsewhere when background work becomes too heavy and running the task in the same process as the web server is not a requirement.
+
+## Sometimes someone's gotta own it
+
+What happens when you know the work is not disposable? In other words, if the process were to die with in-flight tasks, that work must still be completed. That means the work must be recoverable following a failure. For that to be possible, a representation of the work must exist outside the web process, and something other than the web process must be responsible for reading the record and making progress on it. That much can be accomplished with a Postgres table and a cron job. The important thing is that the work exists somewhere that survives the death of the process that owned it. This is the same problem that the IBM batch systems of the 1970s faced, not due to some common ancestry, but because this is a reoccurring architectural problem that continually produces the same requirement. If a submitter is allowed to disappear, someone else must remember what was submitted.
+
+No good deed goes unpunished. Once recovery is possible, so is repetition. Imagine a worker dies halfway through processing a task. Unless it durably recorded its exact progress, the system cannot know how much of the work was completed. It must restart the task. We have now traded losing the work for requiring that the work be safe to run again. When an operation can be run multiple times without cumulative effects, we call it idempotent. I explore how to make repeated background jobs safe in [Idempotency keys for background jobs](/v1/idempotency-keys).
+
+## What changes when the work moves to Hatchet
+
+If you have identified non-disposable work, Hatchet can provide the durable record and orchestration needed to recover from failures and keep attempting the work. Let's take a look at what changes when we move the task out of FastAPI's `BackgroundTasks` and into Hatchet.
+
+Here is the welcome email as a FastAPI background task:
+
+<Snippet src={snippets.python.fastapi_blog.trigger.fast_api_background_tasks} />
+
+And here is the same operation using a Hatchet task:
+
+<Snippet src={snippets.python.fastapi_blog.trigger.hatchet_task} />
+
+[`aio_run` with `wait_for_result=False`](/v1/running-your-task#fire-and-forget) asks the Hatchet engine to create a run and returns a `WorkflowRunRef`. The endpoint can return that run id to the client, giving it something concrete to use when asking about the work later. `BackgroundTasks` has no equivalent handle because it creates no durable record of the work.
+
+The task itself runs on a [worker](/v1/workers), not on the web server. Workers can run elsewhere and [scale independently](/v1/autoscaling-workers), while the engine retains the run's status and result. If a worker disappears, Hatchet can [detect the missing heartbeat and reassign the work](/v1/faq#what-happens-to-running-tasks-when-a-worker-shuts-down). If an attempt fails, Hatchet can retry it according to its configured [retry policy](/v1/retry-policies).
+
+That is the important change. The work now has a durable record outside the web process. If the web server disappears, the run still exists and Hatchet can [continue coordinating attempts to complete it](/v1/architecture-and-guarantees#at-least-once-task-execution). Hatchet also gives the work a lifecycle of its own, including retry and [timeout policies](/v1/timeouts), so those should be configured to fit the workload rather than relying on the lifecycle limits of the web server.
+
+## Forget the wait, not the work
+
+FastAPI `BackgroundTasks` are useful precisely because not every job needs a durable task system. When work may safely disappear with the process, and running it after the response or allowing it to finish during graceful shutdown is useful, `BackgroundTasks` can be exactly the right tool. But they are the wrong tool when the work cannot be lost, or when it needs capabilities such as independent scaling, scheduling, concurrency control, or recovery. At that point, getting the work out of the response's critical path is no longer enough. Something else needs to remember it. That's where Hatchet comes in. Go [check it out](https://cloud.hatchet.run).
+
+To run the examples and reproduce the shutdown experiments yourself, follow the [instructions in the Hatchet repository](https://github.com/hatchet-dev/hatchet/blob/main/sdks/python/examples/fastapi_blog/README.md).

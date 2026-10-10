@@ -20,18 +20,17 @@ class Session:
         pass
 
 
-class User:
-    def __init__(self, id: int, email: str):
-        self.id = id
-        self.email = email
+class User(BaseModel):
+    id: int
+    email: str
 
 
 async def get_user(db: Session, user_id: int) -> User:
-    return User(user_id, "test@example.com")
+    return User(id=user_id, email="test@example.com")
 
 
 async def create_user(db: Session) -> User:
-    return User(1, "test@example.com")
+    return User(id=1, email="test@example.com")
 
 
 async def send_welcome_email(email: str) -> None:
@@ -50,7 +49,7 @@ async def send_welcome_email_task_bg(user_id: int) -> None:
         await send_welcome_email(user.email)
 
 
-@app.post("/user")
+@app.post("/background-tasks/user")
 async def post__create_user__background_tasks(
     background_tasks: BackgroundTasks,
 ) -> User:
@@ -80,17 +79,17 @@ async def send_welcome_email_task_hatchet(
         await send_welcome_email(user.email)
 
 
-@app.post("/user")
-async def post__create_user__hatchet() -> User:
+@app.post("/hatchet/user")
+async def post__create_user__hatchet() -> dict[str, int | str]:
     async with Session() as db:
         user = await create_user(db)
 
-        await send_welcome_email_task_hatchet.aio_run(
+        ref = await send_welcome_email_task_hatchet.aio_run(
             WelcomeEmailInput(user_id=user.id),
             wait_for_result=False,
         )
 
-        return user
+        return {"id": user.id, "welcome_email_run_id": ref.workflow_run_id}
 
 
 # !!

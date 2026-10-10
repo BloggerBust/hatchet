@@ -1,29 +1,14 @@
 # > Worker
-import asyncio
-
-from aiohttp import ClientSession
-
-from hatchet_sdk import Context, EmptyModel, Hatchet
-
-hatchet = Hatchet()
+from examples.fastapi_blog.trigger import hatchet, send_welcome_email_task_hatchet
 
 
-async def fetch(session: ClientSession, url: str) -> bool:
-    async with session.get(url) as response:
-        return response.status == 200
+def main() -> None:
+    worker = hatchet.worker(
+        "fastapi-blog-worker", workflows=[send_welcome_email_task_hatchet]
+    )
+    worker.start()
 
 
-@hatchet.task(name="Fetch")
-async def hello_from_hatchet(input: EmptyModel, ctx: Context) -> dict[str, int]:
-    num_requests = 10
-
-    async with ClientSession() as session:
-        tasks = [
-            fetch(session, "https://docs.hatchet.run/home") for _ in range(num_requests)
-        ]
-
-        results = await asyncio.gather(*tasks)
-
-        return {"count": results.count(True)}
-
+if __name__ == "__main__":
+    main()
 
